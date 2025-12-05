@@ -14,12 +14,13 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Create app.py
+      - name: Create app.py (with 3s throttle to avoid 429)
         run: |
           cat > app.py << 'PY'
           import os
           import csv
           import io
+          import time
           from decimal import Decimal, getcontext
           import requests
           import gspread
@@ -33,6 +34,10 @@ jobs:
           ROUNDING_AVOID_HUNDREDS = os.getenv("ROUNDING_AVOID_HUNDREDS", "true").strip().lower() in ("true", "1", "yes")
           if ROUNDING_MULTIPLE <= 0:
               ROUNDING_MULTIPLE = 5
+
+          SHOPIFY_THROTTLE_SECONDS = int(os.getenv("SHOPIFY_THROTTLE_SECONDS", "3"))
+          if SHOPIFY_THROTTLE_SECONDS < 0:
+              SHOPIFY_THROTTLE_SECONDS = 0
 
           def parse_decimal(s):
               if s is None:
@@ -104,6 +109,7 @@ jobs:
           def shopify_graphql(store, token, version, query, variables):
               url = f"https://{store}/admin/api/{version}/graphql.json"
               headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
+              time.sleep(SHOPIFY_THROTTLE_SECONDS)
               r = requests.post(url, json={"query": query, "variables": variables}, headers=headers, timeout=60)
               r.raise_for_status()
               return r.json()
@@ -125,6 +131,7 @@ jobs:
           def shopify_get_variant(store, token, version, variant_id):
               url = f"https://{store}/admin/api/{version}/variants/{variant_id}.json"
               headers = {"X-Shopify-Access-Token": token}
+              time.sleep(SHOPIFY_THROTTLE_SECONDS)
               r = requests.get(url, headers=headers, timeout=60)
               r.raise_for_status()
               return r.json().get("variant", {})
@@ -133,6 +140,7 @@ jobs:
               url = f"https://{store}/admin/api/{version}/variants/{variant_id}.json"
               headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
               payload = {"variant": {"id": int(variant_id), "price": str(price)}}
+              time.sleep(SHOPIFY_THROTTLE_SECONDS)
               r = requests.put(url, json=payload, headers=headers, timeout=60)
               r.raise_for_status()
               return True
@@ -218,4 +226,5 @@ jobs:
           ROUNDING_MULTIPLE: 5
           ROUNDING_STRATEGY: ceil
           ROUNDING_AVOID_HUNDREDS: true
+          SHOPIFY_THROTTLE_SECONDS: 3
         run: python app.py
