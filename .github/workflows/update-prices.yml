@@ -14,7 +14,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Create app.py (throttle + skip unchanged prices)
+      - name: Crear app.py (GraphQL optimizado + 3s de espera)
         run: |
           cat > app.py << 'PY'
           import os
@@ -106,6 +106,16 @@ jobs:
                       return i
               return None
 
+          def money_amount(m):
+              if m is None:
+                  return None
+              if isinstance(m, dict):
+                  a = m.get("amount")
+                  if a is None:
+                      return None
+                  return str(a)
+              return str(m)
+
           def shopify_graphql(store, token, version, query, variables):
               url = f"https://{store}/admin/api/{version}/graphql.json"
               headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
@@ -114,35 +124,46 @@ jobs:
               r.raise_for_status()
               return r.json()
 
-          def shopify_find_variant_id_by_sku(store, token, version, sku):
-              q = "query($q: String!) { productVariants(first: 1, query: $q) { edges { node { id sku } } } }"
+          def shopify_variant_by_sku(store, token, version, sku):
+              q = """
+              query($q: String!) {
+                productVariants(first: 1, query: $q) {
+                  edges {
+                    node {
+                      id
+                      sku
+                      price { amount }
+                      compareAtPrice { amount }
+                    }
+                  }
+                }
+              }
+              """
               data = shopify_graphql(store, token, version, q, {"q": f"sku:{sku}"})
-              pv = data.get("data", {}).get("productVariants", {}).get("edges", [])
-              if not pv:
+              edges = data.get("data", {}).get("productVariants", {}).get("edges", [])
+              if not edges:
                   return None
-              gid = pv[0].get("node", {}).get("id")
-              if not gid:
-                  return None
-              try:
-                  return gid.split("/")[-1]
-              except Exception:
-                  return None
+              node = edges[0].get("node", {}) or {}
+              vid = node.get("id")
+              price = money_amount(node.get("price"))
+              cap = money_amount(node.get("compareAtPrice"))
+              return {"id": vid, "price": price, "compare_at_price": cap}
 
-          def shopify_get_variant(store, token, version, variant_id):
-              url = f"https://{store}/admin/api/{version}/variants/{variant_id}.json"
-              headers = {"X-Shopify-Access-Token": token}
-              time.sleep(SHOPIFY_THROTTLE_SECONDS)
-              r = requests.get(url, headers=headers, timeout=60)
-              r.raise_for_status()
-              return r.json().get("variant", {})
-
-          def shopify_update_variant_price(store, token, version, variant_id, price):
-              url = f"https://{store}/admin/api/{version}/variants/{variant_id}.json"
-              headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
-              payload = {"variant": {"id": int(variant_id), "price": str(price)}}
-              time.sleep(SHOPIFY_THROTTLE_SECONDS)
-              r = requests.put(url, json=payload, headers=headers, timeout=60)
-              r.raise_for_status()
+          def shopify_update_variant_price(store, token, version, variant_gid, price):
+              m = """
+              mutation productVariantUpdate($input: ProductVariantInput!) {
+                productVariantUpdate(input: $input) {
+                  productVariant { id }
+                  userErrors { field message }
+                }
+              }
+              """
+              variables = {"input": {"id": variant_gid, "price": str(price)}}
+              data = shopify_graphql(store, token, version, m, variables)
+              errs = data.get("data", {}).get("productVariantUpdate", {}).get("userErrors", [])
+              if errs:
+                  messages = "; ".join([e.get("message", "error") for e in errs])
+                  raise RuntimeError(messages)
               return True
 
           def update_prices_in_shopify(ws, provider_map, sku_col_name, store, token, version):
@@ -167,13 +188,11 @@ jobs:
                       missing_neto += 1
                       continue
                   new_price = compute_price(neto)
-                  vid = shopify_find_variant_id_by_sku(store, token, version, sku_key)
-                  if not vid:
+                  var = shopify_variant_by_sku(store, token, version, sku_key)
+                  if not var:
                       not_found += 1
                       continue
-                  var = shopify_get_variant(store, token, version, vid)
-                  cap = var.get("compare_at_price")
-                  if cap is not None and str(cap).strip() != "":
+                  if var.get("compare_at_price") is not None and str(var.get("compare_at_price")).strip() != "":
                       skipped_compare += 1
                       continue
                   current = var.get("price")
@@ -181,7 +200,7 @@ jobs:
                       unchanged += 1
                       continue
                   try:
-                      shopify_update_variant_price(store, token, version, vid, new_price)
+                      shopify_update_variant_price(store, token, version, var["id"], new_price)
                       updated += 1
                   except Exception:
                       continue
@@ -213,10 +232,10 @@ jobs:
               main()
           PY
 
-      - name: Install dependencies (inline)
+      - name: Instalar dependencias
         run: pip install gspread==6.1.4 google-auth==2.35.0 requests==2.32.3
 
-      - name: Run updater
+      - name: Ejecutar actualizador
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
