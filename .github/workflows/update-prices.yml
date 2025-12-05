@@ -14,14 +14,14 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Crear app.py (GraphQL + redondeo cientos → +5 + nueva fórmula)
+      - name: Create app.py (GraphQL optimized + hundreds → +5 + distributor formula)
         run: |
           cat > app.py << 'PY'
           import os
           import csv
           import io
           import time
-          from decimal import Decimal, getcontext
+          from decimal import Decimal, getcontext, InvalidOperation
           import requests
           import gspread
 
@@ -39,6 +39,11 @@ jobs:
           if SHOPIFY_THROTTLE_SECONDS < 0:
               SHOPIFY_THROTTLE_SECONDS = 0
 
+          def normalize_store(store):
+              s = (store or "").strip()
+              s = s.replace("https://", "").replace("http://", "")
+              return s.strip("/")
+
           def parse_decimal(s):
               if s is None:
                   return None
@@ -53,21 +58,17 @@ jobs:
               except Exception:
                   return None
 
-          # Nueva fórmula:
           # price = precio_distribuidores * 1.262 * 1.35 = precio_distribuidores * 1.7037
           def compute_price_from_distributor(dist):
               raw = Decimal(dist) * Decimal("1.7037")
               m = Decimal(ROUNDING_MULTIPLE)
               if raw % m == 0:
-                  price = int(raw)
+                  price_int = int(raw)
               else:
-                  if ROUNDING_STRATEGY == "ceil":
-                      price = int(((raw // m) + 1) * m)
-                  else:
-                      price = int(((raw // m) + 1) * m)
-              if ROUNDING_AVOID_HUNDREDS and price % 100 == 0:
-                  price += ROUNDING_MULTIPLE
-              return price
+                  price_int = int(((raw // m) + 1) * m)  # ceil to next multiple
+              if ROUNDING_AVOID_HUNDREDS and price_int % 100 == 0:
+                  price_int += ROUNDING_MULTIPLE
+              return Decimal(price_int)
 
           def detect_delimiter(sample):
               first_line = sample.splitlines()[0] if sample else ""
@@ -118,6 +119,12 @@ jobs:
                   return str(a)
               return str(m)
 
+          def to_decimal_safe(v):
+              try:
+                  return Decimal(str(v))
+              except (InvalidOperation, TypeError):
+                  return None
+
           def shopify_graphql(store, token, version, query, variables):
               url = f"https://{store}/admin/api/{version}/graphql.json"
               headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
@@ -141,7 +148,8 @@ jobs:
                 }
               }
               """
-              data = shopify_graphql(store, token, version, q, {"q": f"sku:{sku}"})
+              # Quote the SKU in the query to improve matching
+              data = shopify_graphql(store, token, version, q, {"q": f"sku:\"{sku}\""})
               edges = data.get("data", {}).get("productVariants", {}).get("edges", [])
               if not edges:
                   return None
@@ -171,16 +179,17 @@ jobs:
           def update_prices_in_shopify(ws, provider_map, sku_col_name, store, token, version):
               rows = ws.get_all_values()
               if not rows:
-                  return {"updated": 0, "skipped_compare": 0, "missing_dist": 0, "not_found": 0, "unchanged": 0}
+                  return {"updated": 0, "skipped_compare": 0, "missing_dist": 0, "not_found": 0, "unchanged": 0, "samples": {}}
               header = rows[0]
               sku_idx = find_column_index(header, sku_col_name)
               if sku_idx is None:
-                  return {"updated": 0, "skipped_compare": 0, "missing_dist": 0, "not_found": 0, "unchanged": 0}
+                  return {"updated": 0, "skipped_compare": 0, "missing_dist": 0, "not_found": 0, "unchanged": 0, "samples": {}}
               updated = 0
               skipped_compare = 0
               missing_dist = 0
               not_found = 0
               unchanged = 0
+              samples = {"missing_dist": [], "not_found": [], "skipped_compare": [], "unchanged": [], "updated": []}
               for i in range(1, len(rows)):
                   row = rows[i]
                   sku = row[sku_idx - 1] if sku_idx - 1 < len(row) else ""
@@ -188,25 +197,42 @@ jobs:
                   dist = provider_map.get(sku_key)
                   if dist is None:
                       missing_dist += 1
+                      if len(samples["missing_dist"]) < 10:
+                          samples["missing_dist"].append(sku_key)
                       continue
                   new_price = compute_price_from_distributor(dist)
                   var = shopify_variant_by_sku(store, token, version, sku_key)
                   if not var:
                       not_found += 1
+                      if len(samples["not_found"]) < 10:
+                          samples["not_found"].append(sku_key)
                       continue
                   if var.get("compare_at_price") is not None and str(var.get("compare_at_price")).strip() != "":
                       skipped_compare += 1
+                      if len(samples["skipped_compare"]) < 10:
+                          samples["skipped_compare"].append(sku_key)
                       continue
-                  current = var.get("price")
-                  if current is not None and str(current).strip() == str(new_price):
+                  current_dec = to_decimal_safe(var.get("price"))
+                  if current_dec is not None and current_dec == new_price:
                       unchanged += 1
+                      if len(samples["unchanged"]) < 10:
+                          samples["unchanged"].append(sku_key)
                       continue
                   try:
                       shopify_update_variant_price(store, token, version, var["id"], new_price)
                       updated += 1
+                      if len(samples["updated"]) < 10:
+                          samples["updated"].append(sku_key)
                   except Exception:
                       continue
-              return {"updated": updated, "skipped_compare": skipped_compare, "missing_dist": missing_dist, "not_found": not_found, "unchanged": unchanged}
+              return {
+                  "updated": updated,
+                  "skipped_compare": skipped_compare,
+                  "missing_dist": missing_dist,
+                  "not_found": not_found,
+                  "unchanged": unchanged,
+                  "samples": samples
+              }
 
           def main():
               provider_url = os.getenv("PROVIDER_URL", PROVIDER_URL_DEFAULT)
@@ -216,7 +242,8 @@ jobs:
               sheet_id = os.getenv("SHEET_ID")
               sheet_name = os.getenv("SHEET_NAME")
               creds_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-              shop_store = os.getenv("SHOPIFY_STORE")
+              shop_store_raw = os.getenv("SHOPIFY_STORE")
+              shop_store = normalize_store(shop_store_raw)
               shop_token = os.getenv("SHOPIFY_ACCESS_TOKEN")
               shop_version = os.getenv("SHOPIFY_API_VERSION", "2025-01")
               if not creds_json or not sheet_id:
@@ -226,7 +253,13 @@ jobs:
               ws = open_worksheet(creds_json, sheet_id, sheet_name)
               if shop_store and shop_token:
                   sres = update_prices_in_shopify(ws, provider_map, sku_col, shop_store, shop_token, shop_version)
+                  smp = sres.get("samples", {})
                   print(f"shopify_updated={sres['updated']} shopify_skipped_compare={sres['skipped_compare']} shopify_missing_dist={sres['missing_dist']} shopify_not_found={sres['not_found']} shopify_unchanged={sres['unchanged']}")
+                  print(f"samples_updated={smp.get('updated', [])}")
+                  print(f"samples_skipped_compare={smp.get('skipped_compare', [])}")
+                  print(f"samples_missing_dist={smp.get('missing_dist', [])}")
+                  print(f"samples_not_found={smp.get('not_found', [])}")
+                  print(f"samples_unchanged={smp.get('unchanged', [])}")
               else:
                   print("Missing SHOPIFY_STORE or SHOPIFY_ACCESS_TOKEN")
 
@@ -234,10 +267,10 @@ jobs:
               main()
           PY
 
-      - name: Instalar dependencias
+      - name: Install dependencies
         run: pip install gspread==6.1.4 google-auth==2.35.0 requests==2.32.3
 
-      - name: Ejecutar actualizador
+      - name: Run updater
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
