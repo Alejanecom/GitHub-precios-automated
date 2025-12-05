@@ -1,0 +1,33 @@
+name: Update Prices
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run updater
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          SHEET_NAME: ${{ secrets.SHEET_NAME }}
+          PROVIDER_URL: ${{ secrets.PROVIDER_URL }}
+          SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
+          SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
+          SHOPIFY_API_VERSION: 2025-01
+          SKU_COLUMN: SKU
+          PROVIDER_REFERENCE_COLUMN: referencia
+          PROVIDER_NET_PRICE_COLUMN: precio_neto
+          ROUNDING_MULTIPLE: 5
+          ROUNDING_STRATEGY: ceil
+          ROUNDING_AVOID_HUNDREDS: true
+        run: python app.py
