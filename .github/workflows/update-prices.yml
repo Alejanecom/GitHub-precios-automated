@@ -153,86 +153,6 @@ jobs:
                   raise RuntimeError("GraphQL errors: " + "; ".join([e.get("message", "error") for e in resp.get("errors", [])]))
               return resp
 
-          def shopify_fetch_all_variants(store, token, version):
-              q = """
-              query($cursor: String) {
-                productVariants(first: 250, after: $cursor) {
-                  pageInfo { hasNextPage }
-                  edges {
-                    cursor
-                    node {
-                      id
-                      sku
-                      price
-                      compareAtPrice
-                    }
-                  }
-                }
-              }
-              """
-              cursor = None
-              has_next = True
-              result = {}
-              while has_next:
-                  vars = {"cursor": cursor}
-                  data = shopify_graphql(store, token, version, q, vars)
-                  pv = data.get("data", {}).get("productVariants", {})
-                  edges = pv.get("edges", [])
-                  for e in edges:
-                      node = e.get("node", {}) or {}
-                      sku = str(node.get("sku", "")).strip()
-                      if not sku:
-                          continue
-                      result[sku.lower()] = {
-                          "id": node.get("id"),
-                          "price": money_amount(node.get("price")),
-                          "compare_at_price": money_amount(node.get("compareAtPrice")),
-                      }
-                  has_next = pv.get("pageInfo", {}).get("hasNextPage", False)
-                  cursor = edges[-1].get("cursor") if edges else None
-                  if not has_next:
-                      break
-              return result
-
-          def match_variant_for_sku(variant_map, sku):
-              key = str(sku).strip().lower()
-              prefixes = [p.strip().lower() for p in SKU_PREFIX_TO_STRIP.split(",") if p.strip()]
-              candidates = set()
-              candidates.add(key)
-              for p in prefixes:
-                  if key.startswith(p):
-                      candidates.add(key[len(p):])
-              no_dash = key.replace("-", "")
-              candidates.add(no_dash)
-              digits_only = re.sub(r"\D", "", key)
-              if digits_only:
-                  candidates.add(digits_only)
-              m = re.search(r"\d", key)
-              if m:
-                  lead_stripped = key[m.start():]
-                  candidates.add(lead_stripped)
-              mtrail = re.search(r"(\d+)$", key)
-              if mtrail:
-                  candidates.add(mtrail.group(1))
-              longest_num = None
-              for g in re.findall(r"\d+", key):
-                  if longest_num is None or len(g) > len(longest_num):
-                      longest_num = g
-              if longest_num:
-                  candidates.add(longest_num)
-              tokens = [t for t in key.split("-") if t]
-              if tokens:
-                  candidates.add(tokens[-1])
-                  for t in tokens:
-                      if any(ch.isdigit() for ch in t):
-                          candidates.add(t)
-                          break
-                  candidates.add("-".join([t for t in tokens if any(ch.isdigit() for ch in t)]))
-              for c in candidates:
-                  if c in variant_map:
-                      return variant_map[c]
-              return None
-
           def shopify_find_variant_by_candidates(store, token, version, candidates):
               q = """
               query($q: String!) {
@@ -258,25 +178,6 @@ jobs:
                           "compare_at_price": money_amount(node.get("compareAtPrice")),
                       }
               return None
-
-          def shopify_update_variant_price(store, token, version, variant_gid, price):
-              m = """
-              mutation productVariantUpdate($input: ProductVariantInput!) {
-                productVariantUpdate(input: $input) {
-                  productVariant { id }
-                  userErrors { field message }
-                }
-              }
-              """
-              variables = {"input": {"id": variant_gid, "price": str(price)}}
-              try:
-                  data = shopify_graphql(store, token, version, m, variables)
-                  errs = data.get("data", {}).get("productVariantUpdate", {}).get("userErrors", [])
-                  if errs:
-                      return shopify_update_variant_price_rest(store, token, version, variant_gid, price)
-                  return True
-              except Exception:
-                  return shopify_update_variant_price_rest(store, token, version, variant_gid, price)
 
           def extract_variant_numeric_id(variant_gid):
               if not variant_gid:
@@ -305,6 +206,25 @@ jobs:
               r.raise_for_status()
               return True
 
+          def shopify_update_variant_price(store, token, version, variant_gid, price):
+              m = """
+              mutation productVariantUpdate($input: ProductVariantInput!) {
+                productVariantUpdate(input: $input) {
+                  productVariant { id }
+                  userErrors { field message }
+                }
+              }
+              """
+              variables = {"input": {"id": variant_gid, "price": str(price)}}
+              try:
+                  data = shopify_graphql(store, token, version, m, variables)
+                  errs = data.get("data", {}).get("productVariantUpdate", {}).get("userErrors", [])
+                  if errs:
+                      return shopify_update_variant_price_rest(store, token, version, variant_gid, price)
+                  return True
+              except Exception:
+                  return shopify_update_variant_price_rest(store, token, version, variant_gid, price)
+
           def update_prices_in_shopify(ws, provider_map, sku_col_name, store, token, version):
               rows = ws.get_all_values()
               if not rows:
@@ -320,11 +240,6 @@ jobs:
                   sku_key = str(sku).strip()
                   if sku_key:
                       sheet_skus.append(sku_key)
-              variant_map = shopify_fetch_all_variants(store, token, version)
-              try:
-                  print(f"variants_fetched={len(variant_map)}")
-              except Exception:
-                  pass
               updated = 0
               skipped_compare = 0
               missing_dist = 0
@@ -332,30 +247,39 @@ jobs:
               unchanged = 0
               attempts = []
               errors = []
+              matched = 0
               for sku in sheet_skus:
-                  var = match_variant_for_sku(variant_map, sku)
+                  key = str(sku).strip().lower()
+                  prefixes = [p.strip().lower() for p in SKU_PREFIX_TO_STRIP.split(",") if p.strip()]
+                  candidates = set()
+                  candidates.add(key)
+                  for p in prefixes:
+                      if key.startswith(p):
+                          candidates.add(key[len(p):])
+                  candidates.add(key.replace("-", ""))
+                  digits_only = re.sub(r"\D", "", key)
+                  if digits_only:
+                      candidates.add(digits_only)
+                  m = re.search(r"\d", key)
+                  if m:
+                      candidates.add(key[m.start():])
+                  mtrail = re.search(r"(\d+)$", key)
+                  if mtrail:
+                      candidates.add(mtrail.group(1))
+                  longest_num = None
+                  for g in re.findall(r"\d+", key):
+                      if longest_num is None or len(g) > len(longest_num):
+                          longest_num = g
+                  if longest_num:
+                      candidates.add(longest_num)
+                  toks = [t for t in key.split("-") if t]
+                  if toks:
+                      candidates.add(toks[-1])
+                  var = shopify_find_variant_by_candidates(store, token, version, list(candidates))
                   if not var:
-                      key = str(sku).strip().lower()
-                      prefixes = [p.strip().lower() for p in SKU_PREFIX_TO_STRIP.split(",") if p.strip()]
-                      candidates = set()
-                      candidates.add(key)
-                      for p in prefixes:
-                          if key.startswith(p):
-                              candidates.add(key[len(p):])
-                      candidates.add(key.replace("-", ""))
-                      digits_only = re.sub(r"\D", "", key)
-                      if digits_only:
-                          candidates.add(digits_only)
-                      m = re.search(r"\d", key)
-                      if m:
-                          candidates.add(key[m.start():])
-                      toks = [t for t in key.split("-") if t]
-                      if toks:
-                          candidates.add(toks[-1])
-                      var = shopify_find_variant_by_candidates(store, token, version, list(candidates))
-                      if not var:
-                          not_found += 1
-                          continue
+                      not_found += 1
+                      continue
+                  matched += 1
                   dist = provider_map.get(sku.strip().lower())
                   if dist is None:
                       missing_dist += 1
@@ -379,6 +303,7 @@ jobs:
                           errors.append({"sku": sku, "error": str(e)})
                       continue
               try:
+                  print(f"variants_fetched={matched}")
                   print(f"samples_attempts={attempts}")
                   print(f"samples_errors={errors}")
               except Exception:
@@ -431,8 +356,8 @@ jobs:
           ROUNDING_MULTIPLE: ${{ secrets.ROUNDING_MULTIPLE }}
           ROUNDING_STRATEGY: ${{ secrets.ROUNDING_STRATEGY }}
           ROUNDING_AVOID_HUNDREDS: ${{ secrets.ROUNDING_AVOID_HUNDREDS }}
-          SHOPIFY_THROTTLE_SECONDS: ${{ secrets.SHOPIFY_THROTTLE_SECONDS }}
+          SHOPIFY_THROTTLE_SECONDS: "1"
           SKU_PREFIX_TO_STRIP: ${{ secrets.SKU_PREFIX_TO_STRIP }}
-          FALLBACK_SEARCH_MAX_QUERIES: ${{ secrets.FALLBACK_SEARCH_MAX_QUERIES }}
+          FALLBACK_SEARCH_MAX_QUERIES: "2"
           PRICE_MULTIPLIER: "2.2085"
         run: python app.py
