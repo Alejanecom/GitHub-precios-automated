@@ -11,10 +11,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
       - name: Create app.py
         run: |
           cat > app.py << 'PY'
@@ -69,7 +65,19 @@ jobs:
                   return None
 
           def compute_price_from_distributor(dist):
-              raw = Decimal(dist) * Decimal("1.7037")
+              mp_raw = os.getenv("MARKUP_PERCENT", "").strip()
+              pm_raw = os.getenv("PRICE_MULTIPLIER", "").strip()
+              mp = parse_decimal(mp_raw) if mp_raw else None
+              pm = parse_decimal(pm_raw) if pm_raw else None
+              if pm is not None:
+                  raw = Decimal(dist) * pm
+              elif mp is not None:
+                  mult = Decimal("1") + (mp / Decimal("100"))
+                  raw = Decimal(dist) * mult
+              else:
+                  base = Decimal(dist) + (Decimal(dist) * Decimal("0.262"))
+                  result = base + (base * Decimal("0.75"))
+                  raw = result
               m = Decimal(ROUNDING_MULTIPLE)
               if raw % m == 0:
                   price_int = int(raw)
@@ -121,6 +129,11 @@ jobs:
           def money_amount(m):
               if m is None:
                   return None
+              if isinstance(m, dict):
+                  a = m.get("amount")
+                  if a is None:
+                      return None
+                  return str(a)
               return str(m)
 
           def to_decimal_safe(v):
@@ -198,6 +211,15 @@ jobs:
               if m:
                   lead_stripped = key[m.start():]
                   candidates.add(lead_stripped)
+              mtrail = re.search(r"(\d+)$", key)
+              if mtrail:
+                  candidates.add(mtrail.group(1))
+              longest_num = None
+              for g in re.findall(r"\d+", key):
+                  if longest_num is None or len(g) > len(longest_num):
+                      longest_num = g
+              if longest_num:
+                  candidates.add(longest_num)
               tokens = [t for t in key.split("-") if t]
               if tokens:
                   candidates.add(tokens[-1])
@@ -237,9 +259,37 @@ jobs:
                       }
               return None
 
-          def extract_variant_numeric_id(variant_gid):
+          def shopify_update_variant_price(store, token, version, variant_gid, price):
+              m = """
+              mutation productVariantUpdate($input: ProductVariantInput!) {
+                productVariantUpdate(input: $input) {
+                  productVariant { id }
+                  userErrors { field message }
+                }
+              }
+              """
+              variables = {"input": {"id": variant_gid, "price": str(price)}}
               try:
-                  return int(str(variant_gid).split("/")[-1])
+                  data = shopify_graphql(store, token, version, m, variables)
+                  errs = data.get("data", {}).get("productVariantUpdate", {}).get("userErrors", [])
+                  if errs:
+                      return shopify_update_variant_price_rest(store, token, version, variant_gid, price)
+                  return True
+              except Exception:
+                  return shopify_update_variant_price_rest(store, token, version, variant_gid, price)
+
+          def extract_variant_numeric_id(variant_gid):
+              if not variant_gid:
+                  return None
+              s = str(variant_gid)
+              m = re.search(r"/(\d+)$", s)
+              if m:
+                  try:
+                      return int(m.group(1))
+                  except Exception:
+                      return None
+              try:
+                  return int(s)
               except Exception:
                   return None
 
@@ -320,7 +370,7 @@ jobs:
                       unchanged += 1
                       continue
                   try:
-                      shopify_update_variant_price_rest(store, token, version, var["id"], new_price)
+                      shopify_update_variant_price(store, token, version, var["id"], new_price)
                       updated += 1
                       if len(attempts) < 10:
                           attempts.append({"sku": sku, "current": str(current_dec) if current_dec is not None else None, "new": str(new_price)})
@@ -361,9 +411,11 @@ jobs:
               main()
           PY
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: Install dependencies
         run: pip install gspread==6.1.4 google-auth==2.35.0 requests==2.32.3
-
       - name: Run updater
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -382,4 +434,5 @@ jobs:
           SHOPIFY_THROTTLE_SECONDS: ${{ secrets.SHOPIFY_THROTTLE_SECONDS }}
           SKU_PREFIX_TO_STRIP: ${{ secrets.SKU_PREFIX_TO_STRIP }}
           FALLBACK_SEARCH_MAX_QUERIES: ${{ secrets.FALLBACK_SEARCH_MAX_QUERIES }}
+          PRICE_MULTIPLIER: "2.2085"
         run: python app.py
