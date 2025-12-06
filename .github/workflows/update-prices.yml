@@ -1,372 +1,414 @@
-name: Update Prices
+import os
+import csv
+import io
+import time
+from decimal import Decimal, getcontext, InvalidOperation
+import requests
+import gspread
+import re
 
-on:
-  schedule:
-    - cron: "*/15 * * * *"
-  workflow_dispatch:
+getcontext().prec = 28
 
-jobs:
-  update:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+def get_int_env(name, default):
+    val = os.getenv(name)
+    try:
+        if val is None or str(val).strip() == "":
+            return int(default)
+        return int(str(val).strip())
+    except Exception:
+        return int(default)
 
-      - name: Create app.py
-        run: |
-          cat > app.py << 'PY'
-          import os
-          import csv
-          import io
-          import time
-          from decimal import Decimal, getcontext, InvalidOperation
-          import requests
-          import gspread
-          import re
+def normalize_store(store):
+    s = (store or "").strip()
+    s = s.replace("https://", "").replace("http://", "")
+    return s.strip("/")
 
-          getcontext().prec = 28
+PROVIDER_URL = os.getenv("PROVIDER_URL", "").strip()
+if not PROVIDER_URL:
+    raise SystemExit("Missing PROVIDER_URL env")
 
-          def get_int_env(name, default):
-              val = os.getenv(name)
-              try:
-                  if val is None or str(val).strip() == "":
-                      return int(default)
-                  return int(str(val).strip())
-              except Exception:
-                  return int(default)
+ROUNDING_MULTIPLE = get_int_env("ROUNDING_MULTIPLE", 5)
+ROUNDING_STRATEGY = os.getenv("ROUNDING_STRATEGY", "ceil").strip().lower()
+ROUNDING_AVOID_HUNDREDS = os.getenv("ROUNDING_AVOID_HUNDREDS", "true").strip().lower() in ("true", "1", "yes")
+SHOPIFY_THROTTLE_SECONDS = get_int_env("SHOPIFY_THROTTLE_SECONDS", 3)
+SKU_PREFIX_TO_STRIP = os.getenv("SKU_PREFIX_TO_STRIP", "").strip()
+FALLBACK_SEARCH_MAX_QUERIES = get_int_env("FALLBACK_SEARCH_MAX_QUERIES", 4)
 
-          def normalize_store(store):
-              s = (store or "").strip()
-              s = s.replace("https://", "").replace("http://", "")
-              return s.strip("/")
+def parse_decimal(s):
+    if s is None:
+        return None
+    t = str(s).strip()
+    if not t:
+        return None
+    t = t.replace(" ", "")
+    if "," in t and "." not in t:
+        t = t.replace(",", ".")
+    try:
+        return Decimal(t)
+    except Exception:
+        return None
 
-          PROVIDER_URL = os.getenv("PROVIDER_URL", "").strip()
-          if not PROVIDER_URL:
-              raise SystemExit("Missing PROVIDER_URL env")
+def compute_price_from_distributor(dist):
+    mp_raw = os.getenv("MARKUP_PERCENT", "").strip()
+    pm_raw = os.getenv("PRICE_MULTIPLIER", "").strip()
+    mp = parse_decimal(mp_raw) if mp_raw else None
+    pm = parse_decimal(pm_raw) if pm_raw else None
+    if mp is not None:
+        mult = Decimal("1") + (mp / Decimal("100"))
+    elif pm is not None:
+        mult = pm
+    else:
+        mult = Decimal("1.7037")
+    raw = Decimal(dist) * mult
+    m = Decimal(ROUNDING_MULTIPLE)
+    if raw % m == 0:
+        price_int = int(raw)
+    else:
+        price_int = int(((raw // m) + 1) * m)
+    if ROUNDING_AVOID_HUNDREDS and price_int % 100 == 0:
+        price_int += ROUNDING_MULTIPLE
+    return Decimal(price_int)
 
-          ROUNDING_MULTIPLE = get_int_env("ROUNDING_MULTIPLE", 5)
-          ROUNDING_STRATEGY = os.getenv("ROUNDING_STRATEGY", "ceil").strip().lower()
-          ROUNDING_AVOID_HUNDREDS = os.getenv("ROUNDING_AVOID_HUNDREDS", "true").strip().lower() in ("true", "1", "yes")
-          SHOPIFY_THROTTLE_SECONDS = get_int_env("SHOPIFY_THROTTLE_SECONDS", 1)
-          SKU_PREFIX_TO_STRIP = os.getenv("SKU_PREFIX_TO_STRIP", "").strip()
-          FALLBACK_SEARCH_MAX_QUERIES = get_int_env("FALLBACK_SEARCH_MAX_QUERIES", 6)
+def detect_delimiter(sample):
+    first_line = sample.splitlines()[0] if sample else ""
+    sc = first_line.count(";")
+    cc = first_line.count(",")
+    if sc > cc:
+        return ";"
+    return ","
 
-          def parse_decimal(s):
-              if s is None:
-                  return None
-              t = str(s).strip()
-              if not t:
-                  return None
-              t = t.replace(" ", "")
-              if "," in t and "." not in t:
-                  t = t.replace(",", ".")
-              try:
-                  return Decimal(t)
-              except Exception:
-                  return None
+def load_provider_map(url, ref_col, dist_col):
+    r = requests.get(url, timeout=120)
+    r.raise_for_status()
+    text = r.content.decode("utf-8", errors="ignore")
+    delim = detect_delimiter(text[:1000])
+    reader = csv.DictReader(io.StringIO(text), delimiter=delim)
+    m = {}
+    for row in reader:
+        ref = row.get(ref_col)
+        dist = parse_decimal(row.get(dist_col))
+        if not ref or dist is None:
+            continue
+        m[str(ref).strip().lower()] = dist
+    return m
 
-          def compute_price_from_distributor(dist):
-              mp_raw = os.getenv("MARKUP_PERCENT", "").strip()
-              pm_raw = os.getenv("PRICE_MULTIPLIER", "").strip()
-              mp = parse_decimal(mp_raw) if mp_raw else None
-              pm = parse_decimal(pm_raw) if pm_raw else None
-              if pm is not None:
-                  raw = Decimal(dist) * pm
-              elif mp is not None:
-                  mult = Decimal("1") + (mp / Decimal("100"))
-                  raw = Decimal(dist) * mult
-              else:
-                  base = Decimal(dist) + (Decimal(dist) * Decimal("0.262"))
-                  raw = base * Decimal("1.33")
-              m = Decimal(ROUNDING_MULTIPLE)
-              if raw % m == 0:
-                  price_int = int(raw)
-              else:
-                  price_int = int(((raw // m) + 1) * m)
-              if ROUNDING_AVOID_HUNDREDS and price_int % 100 == 0:
-                  price_int += ROUNDING_MULTIPLE
-              return Decimal(price_int)
+def open_worksheet(creds_json, sheet_id, sheet_name):
+    import json
+    data = json.loads(creds_json)
+    gc = gspread.service_account_from_dict(data)
+    sh = gc.open_by_key(sheet_id)
+    if sheet_name:
+        return sh.worksheet(sheet_name)
+    return sh.get_worksheet(0)
 
-          def detect_delimiter(sample):
-              first_line = sample.splitlines()[0] if sample else ""
-              sc = first_line.count(";")
-              cc = first_line.count(",")
-              if sc > cc:
-                  return ";"
-              return ","
+def find_column_index(header, name):
+    name_l = name.strip().lower()
+    for i, h in enumerate(header, start=1):
+        if str(h).strip().lower() == name_l:
+            return i
+    return None
 
-          def load_provider_map(url, ref_col, dist_col):
-              r = requests.get(url, timeout=120)
-              r.raise_for_status()
-              text = r.content.decode("utf-8", errors="ignore")
-              delim = detect_delimiter(text[:1000])
-              reader = csv.DictReader(io.StringIO(text), delimiter=delim)
-              m = {}
-              for row in reader:
-                  ref = row.get(ref_col)
-                  dist = parse_decimal(row.get(dist_col))
-                  if not ref or dist is None:
-                      continue
-                  m[str(ref).strip().lower()] = dist
-              return m
+def money_amount(m):
+    if m is None:
+        return None
+    if isinstance(m, dict):
+        a = m.get("amount")
+        if a is None:
+            return None
+        return str(a)
+    return str(m)
 
-          def open_worksheet(creds_json, sheet_id, sheet_name):
-              import json
-              data = json.loads(creds_json)
-              gc = gspread.service_account_from_dict(data)
-              sh = gc.open_by_key(sheet_id)
-              if sheet_name:
-                  return sh.worksheet(sheet_name)
-              return sh.get_worksheet(0)
+def to_decimal_safe(v):
+    try:
+        return Decimal(str(v))
+    except (InvalidOperation, TypeError):
+        return None
 
-          def find_column_index(header, name):
-              name_l = name.strip().lower()
-              for i, h in enumerate(header, start=1):
-                  if str(h).strip().lower() == name_l:
-                      return i
-              return None
+def shopify_graphql(store, token, version, query, variables):
+    url = f"https://{store}/admin/api/{version}/graphql.json"
+    headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
+    time.sleep(SHOPIFY_THROTTLE_SECONDS)
+    r = requests.post(url, json={"query": query, "variables": variables}, headers=headers, timeout=60)
+    r.raise_for_status()
+    resp = r.json()
+    if resp.get("errors"):
+        raise RuntimeError("GraphQL errors: " + "; ".join([e.get("message", "error") for e in resp.get("errors", [])]))
+    return resp
 
-          def money_amount(m):
-              if m is None:
-                  return None
-              if isinstance(m, dict):
-                  a = m.get("amount")
-                  if a is None:
-                      return None
-                  return str(a)
-              return str(m)
+def shopify_fetch_all_variants(store, token, version):
+    q = """
+    query($cursor: String) {
+      productVariants(first: 250, after: $cursor) {
+        pageInfo { hasNextPage }
+        edges {
+          cursor
+          node {
+            id
+            sku
+            price
+            compareAtPrice
+          }
+        }
+      }
+    }
+    """
+    cursor = None
+    has_next = True
+    result = {}
+    while has_next:
+        vars = {"cursor": cursor}
+        data = shopify_graphql(store, token, version, q, vars)
+        pv = data.get("data", {}).get("productVariants", {})
+        edges = pv.get("edges", [])
+        for e in edges:
+            node = e.get("node", {}) or {}
+            sku = str(node.get("sku", "")).strip()
+            if not sku:
+                continue
+            result[sku.lower()] = {
+                "id": node.get("id"),
+                "price": money_amount(node.get("price")),
+                "compare_at_price": money_amount(node.get("compareAtPrice")),
+            }
+        has_next = pv.get("pageInfo", {}).get("hasNextPage", False)
+        cursor = edges[-1].get("cursor") if edges else None
+        if not has_next:
+            break
+    return result
 
-          def to_decimal_safe(v):
-              try:
-                  return Decimal(str(v))
-              except (InvalidOperation, TypeError):
-                  return None
+def match_variant_for_sku(variant_map, sku):
+    key = str(sku).strip().lower()
+    prefixes = [p.strip().lower() for p in SKU_PREFIX_TO_STRIP.split(",") if p.strip()]
+    candidates = set()
+    candidates.add(key)
+    for p in prefixes:
+        if key.startswith(p):
+            candidates.add(key[len(p):])
+    no_dash = key.replace("-", "")
+    candidates.add(no_dash)
+    digits_only = re.sub(r"\D", "", key)
+    if digits_only:
+        candidates.add(digits_only)
+    m = re.search(r"\d", key)
+    if m:
+        lead_stripped = key[m.start():]
+        candidates.add(lead_stripped)
+    mtrail = re.search(r"(\d+)$", key)
+    if mtrail:
+        candidates.add(mtrail.group(1))
+    longest_num = None
+    for g in re.findall(r"\d+", key):
+        if longest_num is None or len(g) > len(longest_num):
+            longest_num = g
+    if longest_num:
+        candidates.add(longest_num)
+    tokens = [t for t in key.split("-") if t]
+    if tokens:
+        candidates.add(tokens[-1])
+        for t in tokens:
+            if any(ch.isdigit() for ch in t):
+                candidates.add(t)
+                break
+        candidates.add("-".join([t for t in tokens if any(ch.isdigit() for ch in t)]))
+    for c in candidates:
+        if c in variant_map:
+            return variant_map[c]
+    return None
 
-          def shopify_graphql(store, token, version, query, variables):
-              url = f"https://{store}/admin/api/{version}/graphql.json"
-              headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
-              time.sleep(SHOPIFY_THROTTLE_SECONDS)
-              r = requests.post(url, json={"query": query, "variables": variables}, headers=headers, timeout=60)
-              r.raise_for_status()
-              resp = r.json()
-              if resp.get("errors"):
-                  raise RuntimeError("GraphQL errors: " + "; ".join([e.get("message", "error") for e in resp.get("errors", [])]))
-              return resp
+def shopify_find_variant_by_candidates(store, token, version, candidates):
+    q = """
+    query($q: String!) {
+      productVariants(first: 5, query: $q) {
+        edges {
+          node { id sku price compareAtPrice }
+        }
+      }
+    }
+    """
+    tried = 0
+    for c in candidates:
+        if tried >= FALLBACK_SEARCH_MAX_QUERIES:
+            break
+        tried += 1
+        data = shopify_graphql(store, token, version, q, {"q": f'sku:"{c}"'})
+        edges = data.get("data", {}).get("productVariants", {}).get("edges", [])
+        if edges:
+            node = edges[0].get("node", {}) or {}
+            return {
+                "id": node.get("id"),
+                "price": money_amount(node.get("price")),
+                "compare_at_price": money_amount(node.get("compareAtPrice")),
+            }
+        data = shopify_graphql(store, token, version, q, {"q": c})
+        edges = data.get("data", {}).get("productVariants", {}).get("edges", [])
+        if edges:
+            node = edges[0].get("node", {}) or {}
+            return {
+                "id": node.get("id"),
+                "price": money_amount(node.get("price")),
+                "compare_at_price": money_amount(node.get("compareAtPrice")),
+            }
+    return None
 
-          def shopify_find_variant_by_candidates(store, token, version, candidates):
-              q = """
-              query($q: String!) {
-                productVariants(first: 5, query: $q) {
-                  edges {
-                    node { id sku price compareAtPrice }
-                  }
-                }
-              }
-              """
-              tried = 0
-              for c in candidates:
-                  if tried >= FALLBACK_SEARCH_MAX_QUERIES:
-                      break
-                  tried += 1
-                  data = shopify_graphql(store, token, version, q, {"q": f'sku:"{c}"'})
-                  edges = data.get("data", {}).get("productVariants", {}).get("edges", [])
-                  if edges:
-                      node = edges[0].get("node", {}) or {}
-                      return {
-                          "id": node.get("id"),
-                          "price": money_amount(node.get("price")),
-                          "compare_at_price": money_amount(node.get("compareAtPrice")),
-                      }
-                  data = shopify_graphql(store, token, version, q, {"q": c})
-                  edges = data.get("data", {}).get("productVariants", {}).get("edges", [])
-                  if edges:
-                      node = edges[0].get("node", {}) or {}
-                      return {
-                          "id": node.get("id"),
-                          "price": money_amount(node.get("price")),
-                          "compare_at_price": money_amount(node.get("compareAtPrice")),
-                      }
-              return None
+def shopify_update_variant_price(store, token, version, variant_gid, price):
+    m = """
+    mutation productVariantUpdate($input: ProductVariantInput!) {
+      productVariantUpdate(input: $input) {
+        productVariant { id }
+        userErrors { field message }
+      }
+    }
+    """
+    variables = {"input": {"id": variant_gid, "price": str(price)}}
+    try:
+        data = shopify_graphql(store, token, version, m, variables)
+        errs = data.get("data", {}).get("productVariantUpdate", {}).get("userErrors", [])
+        if errs:
+            return shopify_update_variant_price_rest(store, token, version, variant_gid, price)
+        return True
+    except Exception:
+        return shopify_update_variant_price_rest(store, token, version, variant_gid, price)
 
-          def extract_variant_numeric_id(variant_gid):
-              if not variant_gid:
-                  return None
-              s = str(variant_gid)
-              m = re.search(r"/(\d+)$", s)
-              if m:
-                  try:
-                      return int(m.group(1))
-                  except Exception:
-                      return None
-              try:
-                  return int(s)
-              except Exception:
-                  return None
+def extract_variant_numeric_id(variant_gid):
+    if not variant_gid:
+        return None
+    s = str(variant_gid)
+    m = re.search(r"/(\d+)$", s)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    try:
+        return int(s)
+    except Exception:
+        return None
 
-          def shopify_update_variant_price_rest(store, token, version, variant_gid, price):
-              vid = extract_variant_numeric_id(variant_gid)
-              if vid is None:
-                  raise RuntimeError("Invalid variant id")
-              url = f"https://{store}/admin/api/{version}/variants/{vid}.json"
-              headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
-              payload = {"variant": {"id": vid, "price": str(price)}}
-              time.sleep(SHOPIFY_THROTTLE_SECONDS)
-              r = requests.put(url, json=payload, headers=headers, timeout=60)
-              r.raise_for_status()
-              return True
+def shopify_update_variant_price_rest(store, token, version, variant_gid, price):
+    vid = extract_variant_numeric_id(variant_gid)
+    if vid is None:
+        raise RuntimeError("Invalid variant id")
+    url = f"https://{store}/admin/api/{version}/variants/{vid}.json"
+    headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
+    payload = {"variant": {"id": vid, "price": str(price)}}
+    time.sleep(SHOPIFY_THROTTLE_SECONDS)
+    r = requests.put(url, json=payload, headers=headers, timeout=60)
+    r.raise_for_status()
+    return True
 
-          def shopify_update_variant_price(store, token, version, variant_gid, price):
-              m = """
-              mutation productVariantUpdate($input: ProductVariantInput!) {
-                productVariantUpdate(input: $input) {
-                  productVariant { id }
-                  userErrors { field message }
-                }
-              }
-              """
-              variables = {"input": {"id": variant_gid, "price": str(price)}}
-              try:
-                  data = shopify_graphql(store, token, version, m, variables)
-                  errs = data.get("data", {}).get("productVariantUpdate", {}).get("userErrors", [])
-                  if errs:
-                      return shopify_update_variant_price_rest(store, token, version, variant_gid, price)
-                  return True
-              except Exception:
-                  return shopify_update_variant_price_rest(store, token, version, variant_gid, price)
+def update_prices_in_shopify(ws, provider_map, sku_col_name, store, token, version):
+    rows = ws.get_all_values()
+    if not rows:
+        return {"updated": 0, "skipped_compare": 0, "missing_dist": 0, "not_found": 0, "unchanged": 0}
+    header = rows[0]
+    sku_idx = find_column_index(header, sku_col_name)
+    if sku_idx is None:
+        return {"updated": 0, "skipped_compare": 0, "missing_dist": 0, "not_found": 0, "unchanged": 0}
+    sheet_skus = []
+    for i in range(1, len(rows)):
+        row = rows[i]
+        sku = row[sku_idx - 1] if sku_idx - 1 < len(row) else ""
+        sku_key = str(sku).strip()
+        if sku_key:
+            sheet_skus.append(sku_key)
+    try:
+        sheet_skus = list(dict.fromkeys(sheet_skus))
+    except Exception:
+        pass
+    updated = 0
+    skipped_compare = 0
+    missing_dist = 0
+    not_found = 0
+    unchanged = 0
+    attempts = []
+    errors = []
+    matched = 0
+    for sku in sheet_skus:
+        dist = provider_map.get(str(sku).strip().lower())
+        if dist is None:
+            missing_dist += 1
+            continue
+        key = str(sku).strip().lower()
+        prefixes = [p.strip().lower() for p in SKU_PREFIX_TO_STRIP.split(",") if p.strip()]
+        candidates = set()
+        candidates.add(key)
+        for p in prefixes:
+            if key.startswith(p):
+                candidates.add(key[len(p):])
+        candidates.add(key.replace("-", ""))
+        digits_only = re.sub(r"\D", "", key)
+        if digits_only:
+            candidates.add(digits_only)
+        m = re.search(r"\d", key)
+        if m:
+            candidates.add(key[m.start():])
+        mtrail = re.search(r"(\d+)$", key)
+        if mtrail:
+            candidates.add(mtrail.group(1))
+        longest_num = None
+        for g in re.findall(r"\d+", key):
+            if longest_num is None or len(g) > len(longest_num):
+                longest_num = g
+        if longest_num:
+            candidates.add(longest_num)
+        toks = [t for t in key.split("-") if t]
+        if toks:
+            candidates.add(toks[-1])
+        var = shopify_find_variant_by_candidates(store, token, version, list(candidates))
+        if not var:
+            not_found += 1
+            continue
+        matched += 1
+        new_price = compute_price_from_distributor(dist)
+        cap = var.get("compare_at_price")
+        if cap is not None and str(cap).strip() != "":
+            skipped_compare += 1
+            continue
+        current_dec = to_decimal_safe(var.get("price"))
+        if current_dec is not None and current_dec == new_price:
+            unchanged += 1
+            continue
+        try:
+            shopify_update_variant_price(store, token, version, var["id"], new_price)
+            updated += 1
+            if len(attempts) < 10:
+                attempts.append({"sku": sku, "current": str(current_dec) if current_dec is not None else None, "new": str(new_price)})
+        except Exception as e:
+            if len(errors) < 10:
+                errors.append({"sku": sku, "error": str(e)})
+            continue
+    try:
+        print(f"variants_fetched={matched}")
+    except Exception:
+        pass
+    try:
+        print(f"samples_attempts={attempts}")
+        print(f"samples_errors={errors}")
+    except Exception:
+        pass
+    return {"updated": updated, "skipped_compare": skipped_compare, "missing_dist": missing_dist, "not_found": not_found, "unchanged": unchanged}
 
-          def update_prices_in_shopify(ws, provider_map, sku_col_name, store, token, version):
-              rows = ws.get_all_values()
-              if not rows:
-                  return {"updated": 0, "skipped_compare": 0, "missing_dist": 0, "not_found": 0, "unchanged": 0}
-              header = rows[0]
-              sku_idx = find_column_index(header, sku_col_name)
-              if sku_idx is None:
-                  return {"updated": 0, "skipped_compare": 0, "missing_dist": 0, "not_found": 0, "unchanged": 0}
-              sheet_skus = []
-              for i in range(1, len(rows)):
-                  row = rows[i]
-                  sku = row[sku_idx - 1] if sku_idx - 1 < len(row) else ""
-                  sku_key = str(sku).strip()
-                  if sku_key:
-                      sheet_skus.append(sku_key)
-              updated = 0
-              skipped_compare = 0
-              missing_dist = 0
-              not_found = 0
-              unchanged = 0
-              attempts = []
-              errors = []
-              matched = 0
-              for sku in sheet_skus:
-                  key = str(sku).strip().lower()
-                  prefixes = [p.strip().lower() for p in SKU_PREFIX_TO_STRIP.split(",") if p.strip()]
-                  candidates = set()
-                  candidates.add(key)
-                  for p in prefixes:
-                      if key.startswith(p):
-                          candidates.add(key[len(p):])
-                  candidates.add(key.replace("-", ""))
-                  digits_only = re.sub(r"\D", "", key)
-                  if digits_only:
-                      candidates.add(digits_only)
-                  m = re.search(r"\d", key)
-                  if m:
-                      candidates.add(key[m.start():])
-                  mtrail = re.search(r"(\d+)$", key)
-                  if mtrail:
-                      candidates.add(mtrail.group(1))
-                  longest_num = None
-                  for g in re.findall(r"\d+", key):
-                      if longest_num is None or len(g) > len(longest_num):
-                          longest_num = g
-                  if longest_num:
-                      candidates.add(longest_num)
-                  toks = [t for t in key.split("-") if t]
-                  if toks:
-                      candidates.add(toks[-1])
-                      candidates.add("-".join([t for t in toks if any(ch.isdigit() for ch in t)]))
-                  var = shopify_find_variant_by_candidates(store, token, version, list(candidates))
-                  if not var:
-                      not_found += 1
-                      continue
-                  matched += 1
-                  dist = provider_map.get(sku.strip().lower())
-                  if dist is None:
-                      missing_dist += 1
-                      continue
-                  new_price = compute_price_from_distributor(dist)
-                  cap = var.get("compare_at_price")
-                  if cap is not None and str(cap).strip() != "":
-                      skipped_compare += 1
-                      continue
-                  current_dec = to_decimal_safe(var.get("price"))
-                  if current_dec is not None and current_dec == new_price:
-                      unchanged += 1
-                      continue
-                  try:
-                      shopify_update_variant_price(store, token, version, var["id"], new_price)
-                      updated += 1
-                      if len(attempts) < 10:
-                          attempts.append({"sku": sku, "current": str(current_dec) if current_dec is not None else None, "new": str(new_price)})
-                  except Exception as e:
-                      if len(errors) < 10:
-                          errors.append({"sku": sku, "error": str(e)})
-                      continue
-              try:
-                  print(f"variants_fetched={matched}")
-                  print(f"samples_attempts={attempts}")
-                  print(f"samples_errors={errors}")
-              except Exception:
-                  pass
-              return {"updated": updated, "skipped_compare": skipped_compare, "missing_dist": missing_dist, "not_found": not_found, "unchanged": unchanged}
+def main():
+    ref_col = os.getenv("PROVIDER_REFERENCE_COLUMN", "referencia")
+    dist_col = os.getenv("PROVIDER_DISTRIBUTOR_PRICE_COLUMN", "precio_distribuidores")
+    sku_col = os.getenv("SKU_COLUMN", "SKU")
+    sheet_id = os.getenv("SHEET_ID")
+    sheet_name = os.getenv("SHEET_NAME")
+    creds_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    shop_store_raw = os.getenv("SHOPIFY_STORE")
+    shop_store = normalize_store(shop_store_raw)
+    shop_token = os.getenv("SHOPIFY_ACCESS_TOKEN")
+    shop_version = os.getenv("SHOPIFY_API_VERSION", "2024-10")
+    if not creds_json or not sheet_id:
+        print("Missing GOOGLE_SERVICE_ACCOUNT_JSON or SHEET_ID")
+        return
+    provider_map = load_provider_map(PROVIDER_URL, ref_col, dist_col)
+    ws = open_worksheet(creds_json, sheet_id, sheet_name)
+    if shop_store and shop_token:
+        sres = update_prices_in_shopify(ws, provider_map, sku_col, shop_store, shop_token, shop_version)
+        print(f"shopify_updated={sres['updated']} shopify_skipped_compare={sres['skipped_compare']} shopify_missing_dist={sres['missing_dist']} shopify_not_found={sres['not_found']} shopify_unchanged={sres['unchanged']}")
+    else:
+        print("Missing SHOPIFY_STORE or SHOPIFY_ACCESS_TOKEN")
 
-          def main():
-              ref_col = os.getenv("PROVIDER_REFERENCE_COLUMN", "referencia")
-              dist_col = os.getenv("PROVIDER_DISTRIBUTOR_PRICE_COLUMN", "precio_distribuidores")
-              sku_col = os.getenv("SKU_COLUMN", "SKU")
-              sheet_id = os.getenv("SHEET_ID")
-              sheet_name = os.getenv("SHEET_NAME")
-              creds_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-              shop_store_raw = os.getenv("SHOPIFY_STORE")
-              shop_store = normalize_store(shop_store_raw)
-              shop_token = os.getenv("SHOPIFY_ACCESS_TOKEN")
-              shop_version = os.getenv("SHOPIFY_API_VERSION", "2024-10")
-              if not creds_json or not sheet_id:
-                  print("Missing GOOGLE_SERVICE_ACCOUNT_JSON or SHEET_ID")
-                  return
-              provider_map = load_provider_map(PROVIDER_URL, ref_col, dist_col)
-              ws = open_worksheet(creds_json, sheet_id, sheet_name)
-              if shop_store and shop_token:
-                  sres = update_prices_in_shopify(ws, provider_map, sku_col, shop_store, shop_token, shop_version)
-                  print(f"shopify_updated={sres['updated']} shopify_skipped_compare={sres['skipped_compare']} shopify_missing_dist={sres['missing_dist']} shopify_not_found={sres['not_found']} shopify_unchanged={sres['unchanged']}")
-              else:
-                  print("Missing SHOPIFY_STORE or SHOPIFY_ACCESS_TOKEN")
-
-          if __name__ == "__main__":
-              main()
-          PY
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Install dependencies
-        run: pip install gspread==6.1.4 google-auth==2.35.0 requests==2.32.3
-      - name: Run updater
-        env:
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-          SHEET_NAME: ${{ secrets.SHEET_NAME }}
-          PROVIDER_URL: ${{ secrets.PROVIDER_URL }}
-          SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
-          SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
-          SHOPIFY_API_VERSION: ${{ secrets.SHOPIFY_API_VERSION }}
-          SKU_COLUMN: ${{ secrets.SKU_COLUMN }}
-          PROVIDER_REFERENCE_COLUMN: ${{ secrets.PROVIDER_REFERENCE_COLUMN }}
-          PROVIDER_DISTRIBUTOR_PRICE_COLUMN: ${{ secrets.PROVIDER_DISTRIBUTOR_PRICE_COLUMN }}
-          ROUNDING_MULTIPLE: ${{ secrets.ROUNDING_MULTIPLE }}
-          ROUNDING_STRATEGY: ${{ secrets.ROUNDING_STRATEGY }}
-          ROUNDING_AVOID_HUNDREDS: ${{ secrets.ROUNDING_AVOID_HUNDREDS }}
-          SHOPIFY_THROTTLE_SECONDS: "1"
-          SKU_PREFIX_TO_STRIP: ${{ secrets.SKU_PREFIX_TO_STRIP }}
-          FALLBACK_SEARCH_MAX_QUERIES: "6"
-          PRICE_MULTIPLIER: "1.67846"
-        run: python app.py
+if __name__ == "__main__":
+    main()
