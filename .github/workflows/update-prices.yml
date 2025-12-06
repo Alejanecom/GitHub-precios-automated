@@ -14,7 +14,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Create app.py (GraphQL + distributor formula + rounding + SKU fallbacks)
+      - name: Create app.py (Sheet-driven, robust SKU matching, distributor formula, rounding)
         run: |
           cat > app.py << 'PY'
           import os
@@ -67,7 +67,7 @@ jobs:
               if raw % m == 0:
                   price_int = int(raw)
               else:
-                  price_int = int(((raw // m) + 1) * m)  # ceil to next multiple of ROUNDING_MULTIPLE
+                  price_int = int(((raw // m) + 1) * m)
               if ROUNDING_AVOID_HUNDREDS and price_int % 100 == 0:
                   price_int += ROUNDING_MULTIPLE
               return Decimal(price_int)
@@ -135,32 +135,27 @@ jobs:
               r.raise_for_status()
               return r.json()
 
+          # Robust: productVariants search then filter exact match (case-insensitive), with multiple query shapes
           def shopify_variant_by_sku(store, token, version, sku):
-              # Try multiple query shapes to reduce 'not_found'
-              queries = [
-                  f'sku:"{sku}"',
-                  f"sku:{sku}",
-              ]
-              # Strip known prefix
-              if SKU_PREFIX_TO_STRIP and sku.startswith(SKU_PREFIX_TO_STRIP):
-                  stripped = sku[len(SKU_PREFIX_TO_STRIP):]
-                  queries.append(f'sku:"{stripped}"')
-                  queries.append(f"sku:{stripped}")
-              # Remove dashes
-              no_dash = sku.replace("-", "")
-              if no_dash != sku:
-                  queries.append(f'sku:"{no_dash}"')
-                  queries.append(f"sku:{no_dash}")
-              # Last token after dash (e.g., D-237107 -> 237107)
-              tokens = sku.split("-")
+              sku_norm = str(sku).strip()
+              candidates = [sku_norm]
+              if SKU_PREFIX_TO_STRIP and sku_norm.startswith(SKU_PREFIX_TO_STRIP):
+                  candidates.append(sku_norm[len(SKU_PREFIX_TO_STRIP):])
+              no_dash = sku_norm.replace("-", "")
+              if no_dash != sku_norm:
+                  candidates.append(no_dash)
+              tokens = sku_norm.split("-")
               if len(tokens) > 1:
-                  last_tok = tokens[-1]
-                  queries.append(f'sku:"{last_tok}"')
-                  queries.append(f"sku:{last_tok}")
+                  candidates.append(tokens[-1])
+
+              queries = []
+              for c in candidates:
+                  queries.append(f'sku:"{c}"')
+                  queries.append(f"sku:{c}")
 
               q = """
               query($q: String!) {
-                productVariants(first: 1, query: $q) {
+                productVariants(first: 50, query: $q) {
                   edges {
                     node {
                       id
@@ -175,13 +170,20 @@ jobs:
               for qry in queries:
                   data = shopify_graphql(store, token, version, q, {"q": qry})
                   edges = data.get("data", {}).get("productVariants", {}).get("edges", [])
-                  if edges:
-                      node = edges[0].get("node", {}) or {}
-                      vid = node.get("id")
-                      price = money_amount(node.get("price"))
-                      cap = money_amount(node.get("compareAtPrice"))
-                      found_sku = node.get("sku")
-                      return {"id": vid, "price": price, "compare_at_price": cap, "matched_query": qry, "found_sku": found_sku}
+                  if not edges:
+                      continue
+                  for e in edges:
+                      node = e.get("node", {}) or {}
+                      found_sku = str(node.get("sku", "")).strip()
+                      # case-insensitive exact match against any candidate
+                      if found_sku.lower() in [c.lower() for c in candidates]:
+                          return {
+                              "id": node.get("id"),
+                              "price": money_amount(node.get("price")),
+                              "compare_at_price": money_amount(node.get("compareAtPrice")),
+                              "matched_query": qry,
+                              "found_sku": found_sku
+                          }
               return None
 
           def shopify_update_variant_price(store, token, version, variant_gid, price):
@@ -215,6 +217,7 @@ jobs:
               not_found = 0
               unchanged = 0
               samples = {"missing_dist": [], "not_found": [], "skipped_compare": [], "unchanged": [], "updated": [], "matched": []}
+
               for i in range(1, len(rows)):
                   row = rows[i]
                   sku = row[sku_idx - 1] if sku_idx - 1 < len(row) else ""
@@ -225,6 +228,7 @@ jobs:
                       if len(samples["missing_dist"]) < 10:
                           samples["missing_dist"].append(sku_key)
                       continue
+
                   new_price = compute_price_from_distributor(dist)
                   var = shopify_variant_by_sku(store, token, version, sku_key)
                   if not var:
@@ -232,19 +236,23 @@ jobs:
                       if len(samples["not_found"]) < 10:
                           samples["not_found"].append(sku_key)
                       continue
+
                   if len(samples["matched"]) < 10:
                       samples["matched"].append({"sku": sku_key, "found_sku": var.get("found_sku"), "query": var.get("matched_query")})
+
                   if var.get("compare_at_price") is not None and str(var.get("compare_at_price")).strip() != "":
                       skipped_compare += 1
                       if len(samples["skipped_compare"]) < 10:
                           samples["skipped_compare"].append(sku_key)
                       continue
+
                   current_dec = to_decimal_safe(var.get("price"))
                   if current_dec is not None and current_dec == new_price:
                       unchanged += 1
                       if len(samples["unchanged"]) < 10:
                           samples["unchanged"].append(sku_key)
                       continue
+
                   try:
                       shopify_update_variant_price(store, token, version, var["id"], new_price)
                       updated += 1
@@ -252,6 +260,7 @@ jobs:
                           samples["updated"].append(sku_key)
                   except Exception:
                       continue
+
               return {
                   "updated": updated,
                   "skipped_compare": skipped_compare,
