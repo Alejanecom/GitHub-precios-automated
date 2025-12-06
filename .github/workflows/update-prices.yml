@@ -27,7 +27,9 @@ jobs:
 
           getcontext().prec = 28
 
-          PROVIDER_URL_DEFAULT = "https://store.dreamlove.es/dyndata/exportaciones/csvzip/catalog_1_50_125_2_eb10a792c0336bc695e2b0ec29d88402_csv_plain.csv?tkn=28cc4e818950d81c1d322225464f29e4a8fd9381c561188ba29ff5699cc273fd"
+          PROVIDER_URL = os.getenv("PROVIDER_URL", "").strip()
+          if not PROVIDER_URL:
+              raise SystemExit("Missing PROVIDER_URL env")
 
           ROUNDING_MULTIPLE = int(os.getenv("ROUNDING_MULTIPLE", "5"))
           ROUNDING_STRATEGY = os.getenv("ROUNDING_STRATEGY", "ceil").strip().lower()
@@ -60,7 +62,7 @@ jobs:
               except Exception:
                   return None
 
-          # price = precio_distribuidores * 1.262 * 1.35 = precio_distribuidores * 1.7037
+          # Formula: precio_distribuidores * 1.262, then +35% => * 1.7037
           def compute_price_from_distributor(dist):
               raw = Decimal(dist) * Decimal("1.7037")
               m = Decimal(ROUNDING_MULTIPLE)
@@ -135,7 +137,7 @@ jobs:
               r.raise_for_status()
               return r.json()
 
-          # Robust: productVariants search then filter exact match (case-insensitive), with multiple query shapes
+          # Search variants and filter exact SKU match (case-insensitive), trying multiple query shapes
           def shopify_variant_by_sku(store, token, version, sku):
               sku_norm = str(sku).strip()
               candidates = [sku_norm]
@@ -155,7 +157,7 @@ jobs:
 
               q = """
               query($q: String!) {
-                productVariants(first: 50, query: $q) {
+                productVariants(first: 250, query: $q) {
                   edges {
                     node {
                       id
@@ -175,7 +177,63 @@ jobs:
                   for e in edges:
                       node = e.get("node", {}) or {}
                       found_sku = str(node.get("sku", "")).strip()
-                      # case-insensitive exact match against any candidate
+                      if found_sku.lower() in [c.lower() for c in candidates]:
+                          return {
+                              "id": node.get("id"),
+                              "price": money_amount(node.get("price")),
+                              "compare_at_price": money_amount(node.get("compareAtPrice")),
+                              "matched_query": qry,
+                              "found_sku": found_sku
+                          }
+              return None
+
+          # Fallback: products query, then scan variants for exact SKU
+          def shopify_variant_by_sku_fallback_products(store, token, version, sku):
+              sku_norm = str(sku).strip()
+              candidates = [sku_norm]
+              if SKU_PREFIX_TO_STRIP and sku_norm.startswith(SKU_PREFIX_TO_STRIP):
+                  candidates.append(sku_norm[len(SKU_PREFIX_TO_STRIP):])
+              no_dash = sku_norm.replace("-", "")
+              if no_dash != sku_norm:
+                  candidates.append(no_dash)
+              tokens = sku_norm.split("-")
+              if len(tokens) > 1:
+                  candidates.append(tokens[-1])
+
+              queries = []
+              for c in candidates:
+                  queries.append(f'sku:"{c}"')
+                  queries.append(f"sku:{c}")
+
+              q = """
+              query($q: String!) {
+                products(first: 1, query: $q) {
+                  edges {
+                    node {
+                      variants(first: 250) {
+                        edges {
+                          node {
+                            id
+                            sku
+                            price { amount }
+                            compareAtPrice { amount }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+              """
+              for qry in queries:
+                  data = shopify_graphql(store, token, version, q, {"q": qry})
+                  edges = data.get("data", {}).get("products", {}).get("edges", [])
+                  if not edges:
+                      continue
+                  var_edges = edges[0]["node"]["variants"]["edges"]
+                  for ve in var_edges:
+                      node = ve["node"]
+                      found_sku = str(node.get("sku", "")).strip()
                       if found_sku.lower() in [c.lower() for c in candidates]:
                           return {
                               "id": node.get("id"),
@@ -232,6 +290,8 @@ jobs:
                   new_price = compute_price_from_distributor(dist)
                   var = shopify_variant_by_sku(store, token, version, sku_key)
                   if not var:
+                      var = shopify_variant_by_sku_fallback_products(store, token, version, sku_key)
+                  if not var:
                       not_found += 1
                       if len(samples["not_found"]) < 10:
                           samples["not_found"].append(sku_key)
@@ -271,7 +331,6 @@ jobs:
               }
 
           def main():
-              provider_url = os.getenv("PROVIDER_URL", PROVIDER_URL_DEFAULT)
               ref_col = os.getenv("PROVIDER_REFERENCE_COLUMN", "referencia")
               dist_col = os.getenv("PROVIDER_DISTRIBUTOR_PRICE_COLUMN", "precio_distribuidores")
               sku_col = os.getenv("SKU_COLUMN", "SKU")
@@ -281,11 +340,11 @@ jobs:
               shop_store_raw = os.getenv("SHOPIFY_STORE")
               shop_store = normalize_store(shop_store_raw)
               shop_token = os.getenv("SHOPIFY_ACCESS_TOKEN")
-              shop_version = os.getenv("SHOPIFY_API_VERSION", "2025-01")
+              shop_version = os.getenv("SHOPIFY_API_VERSION", "2024-10")
               if not creds_json or not sheet_id:
                   print("Missing GOOGLE_SERVICE_ACCOUNT_JSON or SHEET_ID")
                   return
-              provider_map = load_provider_map(provider_url, ref_col, dist_col)
+              provider_map = load_provider_map(PROVIDER_URL, ref_col, dist_col)
               ws = open_worksheet(creds_json, sheet_id, sheet_name)
               if shop_store and shop_token:
                   sres = update_prices_in_shopify(ws, provider_map, sku_col, shop_store, shop_token, shop_version)
@@ -315,13 +374,13 @@ jobs:
           PROVIDER_URL: ${{ secrets.PROVIDER_URL }}
           SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
           SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
-          SHOPIFY_API_VERSION: 2025-01
-          SKU_COLUMN: SKU
-          PROVIDER_REFERENCE_COLUMN: referencia
-          PROVIDER_DISTRIBUTOR_PRICE_COLUMN: precio_distribuidores
-          ROUNDING_MULTIPLE: 5
-          ROUNDING_STRATEGY: ceil
-          ROUNDING_AVOID_HUNDREDS: true
-          SHOPIFY_THROTTLE_SECONDS: 3
-          SKU_PREFIX_TO_STRIP: D-
+          SHOPIFY_API_VERSION: ${{ secrets.SHOPIFY_API_VERSION }}
+          SKU_COLUMN: ${{ secrets.SKU_COLUMN }}
+          PROVIDER_REFERENCE_COLUMN: ${{ secrets.PROVIDER_REFERENCE_COLUMN }}
+          PROVIDER_DISTRIBUTOR_PRICE_COLUMN: ${{ secrets.PROVIDER_DISTRIBUTOR_PRICE_COLUMN }}
+          ROUNDING_MULTIPLE: ${{ secrets.ROUNDING_MULTIPLE }}
+          ROUNDING_STRATEGY: ${{ secrets.ROUNDING_STRATEGY }}
+          ROUNDING_AVOID_HUNDREDS: ${{ secrets.ROUNDING_AVOID_HUNDREDS }}
+          SHOPIFY_THROTTLE_SECONDS: ${{ secrets.SHOPIFY_THROTTLE_SECONDS }}
+          SKU_PREFIX_TO_STRIP: ${{ secrets.SKU_PREFIX_TO_STRIP }}
         run: python app.py
