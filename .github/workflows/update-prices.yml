@@ -36,7 +36,7 @@ jobs:
 
           def normalize_store(store):
               s = (store or "").strip()
-              s = s.replace("https://", "http://", "")
+              s = s.replace("https://", "").replace("http://", "")
               return s.strip("/")
 
           PROVIDER_URL = os.getenv("PROVIDER_URL", "").strip()
@@ -359,7 +359,7 @@ jobs:
           if __name__ == "__main__":
               main()
           PY
-      
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
