@@ -155,8 +155,8 @@ jobs:
                     node {
                       id
                       sku
-                      price { amount }
-                      compareAtPrice { amount }
+                      price
+                      compareAtPrice
                     }
                   }
                 }
@@ -221,7 +221,7 @@ jobs:
               query($q: String!) {
                 productVariants(first: 5, query: $q) {
                   edges {
-                    node { id sku price { amount } compareAtPrice { amount } }
+                    node { id sku price compareAtPrice }
                   }
                 }
               }
