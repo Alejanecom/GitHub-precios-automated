@@ -121,11 +121,6 @@ jobs:
           def money_amount(m):
               if m is None:
                   return None
-              if isinstance(m, dict):
-                  a = m.get("amount")
-                  if a is None:
-                      return None
-                  return str(a)
               return str(m)
 
           def to_decimal_safe(v):
@@ -283,6 +278,8 @@ jobs:
               missing_dist = 0
               not_found = 0
               unchanged = 0
+              attempts = []
+              errors = []
               for sku in sheet_skus:
                   var = match_variant_for_sku(variant_map, sku)
                   if not var:
@@ -323,8 +320,17 @@ jobs:
                   try:
                       shopify_update_variant_price(store, token, version, var["id"], new_price)
                       updated += 1
-                  except Exception:
+                      if len(attempts) < 10:
+                          attempts.append({"sku": sku, "current": str(current_dec) if current_dec is not None else None, "new": str(new_price)})
+                  except Exception as e:
+                      if len(errors) < 10:
+                          errors.append({"sku": sku, "error": str(e)})
                       continue
+              try:
+                  print(f"samples_attempts={attempts}")
+                  print(f"samples_errors={errors}")
+              except Exception:
+                  pass
               return {"updated": updated, "skipped_compare": skipped_compare, "missing_dist": missing_dist, "not_found": not_found, "unchanged": unchanged}
 
           def main():
