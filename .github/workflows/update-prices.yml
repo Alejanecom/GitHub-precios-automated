@@ -48,7 +48,7 @@ jobs:
           ROUNDING_AVOID_HUNDREDS = os.getenv("ROUNDING_AVOID_HUNDREDS", "true").strip().lower() in ("true", "1", "yes")
           SHOPIFY_THROTTLE_SECONDS = get_int_env("SHOPIFY_THROTTLE_SECONDS", 1)
           SKU_PREFIX_TO_STRIP = os.getenv("SKU_PREFIX_TO_STRIP", "").strip()
-          FALLBACK_SEARCH_MAX_QUERIES = get_int_env("FALLBACK_SEARCH_MAX_QUERIES", 2)
+          FALLBACK_SEARCH_MAX_QUERIES = get_int_env("FALLBACK_SEARCH_MAX_QUERIES", 6)
 
           def parse_decimal(s):
               if s is None:
@@ -176,6 +176,15 @@ jobs:
                           "price": money_amount(node.get("price")),
                           "compare_at_price": money_amount(node.get("compareAtPrice")),
                       }
+                  data = shopify_graphql(store, token, version, q, {"q": c})
+                  edges = data.get("data", {}).get("productVariants", {}).get("edges", [])
+                  if edges:
+                      node = edges[0].get("node", {}) or {}
+                      return {
+                          "id": node.get("id"),
+                          "price": money_amount(node.get("price")),
+                          "compare_at_price": money_amount(node.get("compareAtPrice")),
+                      }
               return None
 
           def extract_variant_numeric_id(variant_gid):
@@ -274,31 +283,7 @@ jobs:
                   toks = [t for t in key.split("-") if t]
                   if toks:
                       candidates.add(toks[-1])
-                  def shopify_find_variant_by_candidates(store, token, version, candidates):
-                      q = """
-                      query($q: String!) {
-                        productVariants(first: 5, query: $q) {
-                          edges {
-                            node { id sku price compareAtPrice }
-                          }
-                        }
-                      }
-                      """
-                      tried = 0
-                      for c in candidates:
-                          if tried >= FALLBACK_SEARCH_MAX_QUERIES:
-                              break
-                          tried += 1
-                          data = shopify_graphql(store, token, version, q, {"q": f'sku:"{c}"'})
-                          edges = data.get("data", {}).get("productVariants", {}).get("edges", [])
-                          if edges:
-                              node = edges[0].get("node", {}) or {}
-                              return {
-                                  "id": node.get("id"),
-                                  "price": money_amount(node.get("price")),
-                                  "compare_at_price": money_amount(node.get("compareAtPrice")),
-                              }
-                      return None
+                      candidates.add("-".join([t for t in toks if any(ch.isdigit() for ch in t)]))
                   var = shopify_find_variant_by_candidates(store, token, version, list(candidates))
                   if not var:
                       not_found += 1
@@ -382,6 +367,6 @@ jobs:
           ROUNDING_AVOID_HUNDREDS: ${{ secrets.ROUNDING_AVOID_HUNDREDS }}
           SHOPIFY_THROTTLE_SECONDS: "1"
           SKU_PREFIX_TO_STRIP: ${{ secrets.SKU_PREFIX_TO_STRIP }}
-          FALLBACK_SEARCH_MAX_QUERIES: "2"
+          FALLBACK_SEARCH_MAX_QUERIES: "6"
           PRICE_MULTIPLIER: "1.67846"
         run: python app.py
