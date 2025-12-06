@@ -237,20 +237,22 @@ jobs:
                       }
               return None
 
-          def shopify_update_variant_price(store, token, version, variant_gid, price):
-              m = """
-              mutation productVariantUpdate($input: ProductVariantInput!) {
-                productVariantUpdate(input: $input) {
-                  productVariant { id }
-                  userErrors { field message }
-                }
-              }
-              """
-              variables = {"input": {"id": variant_gid, "price": str(price)}}
-              data = shopify_graphql(store, token, version, m, variables)
-              errs = data.get("data", {}).get("productVariantUpdate", {}).get("userErrors", [])
-              if errs:
-                  raise RuntimeError("; ".join([e.get("message", "error") for e in errs]))
+          def extract_variant_numeric_id(variant_gid):
+              try:
+                  return int(str(variant_gid).split("/")[-1])
+              except Exception:
+                  return None
+
+          def shopify_update_variant_price_rest(store, token, version, variant_gid, price):
+              vid = extract_variant_numeric_id(variant_gid)
+              if vid is None:
+                  raise RuntimeError("Invalid variant id")
+              url = f"https://{store}/admin/api/{version}/variants/{vid}.json"
+              headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
+              payload = {"variant": {"id": vid, "price": str(price)}}
+              time.sleep(SHOPIFY_THROTTLE_SECONDS)
+              r = requests.put(url, json=payload, headers=headers, timeout=60)
+              r.raise_for_status()
               return True
 
           def update_prices_in_shopify(ws, provider_map, sku_col_name, store, token, version):
@@ -318,7 +320,7 @@ jobs:
                       unchanged += 1
                       continue
                   try:
-                      shopify_update_variant_price(store, token, version, var["id"], new_price)
+                      shopify_update_variant_price_rest(store, token, version, var["id"], new_price)
                       updated += 1
                       if len(attempts) < 10:
                           attempts.append({"sku": sku, "current": str(current_dec) if current_dec is not None else None, "new": str(new_price)})
