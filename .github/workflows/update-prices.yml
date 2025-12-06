@@ -22,9 +22,7 @@ jobs:
           import requests
           import gspread
           import re
-
           getcontext().prec = 28
-
           def get_int_env(name, default):
               val = os.getenv(name)
               try:
@@ -33,23 +31,19 @@ jobs:
                   return int(str(val).strip())
               except Exception:
                   return int(default)
-
           def normalize_store(store):
               s = (store or "").strip()
               s = s.replace("https://", "").replace("http://", "")
               return s.strip("/")
-
           PROVIDER_URL = os.getenv("PROVIDER_URL", "").strip()
           if not PROVIDER_URL:
               raise SystemExit("Missing PROVIDER_URL env")
-
           ROUNDING_MULTIPLE = get_int_env("ROUNDING_MULTIPLE", 5)
           ROUNDING_STRATEGY = os.getenv("ROUNDING_STRATEGY", "ceil").strip().lower()
           ROUNDING_AVOID_HUNDREDS = os.getenv("ROUNDING_AVOID_HUNDREDS", "true").strip().lower() in ("true", "1", "yes")
           SHOPIFY_THROTTLE_SECONDS = get_int_env("SHOPIFY_THROTTLE_SECONDS", 3)
           SKU_PREFIX_TO_STRIP = os.getenv("SKU_PREFIX_TO_STRIP", "").strip()
           FALLBACK_SEARCH_MAX_QUERIES = get_int_env("FALLBACK_SEARCH_MAX_QUERIES", 6)
-
           def parse_decimal(s):
               if s is None:
                   return None
@@ -63,7 +57,6 @@ jobs:
                   return Decimal(t)
               except Exception:
                   return None
-
           def compute_price_from_distributor(dist):
               mp_raw = os.getenv("MARKUP_PERCENT", "").strip()
               pm_raw = os.getenv("PRICE_MULTIPLIER", "").strip()
@@ -84,7 +77,6 @@ jobs:
               if ROUNDING_AVOID_HUNDREDS and price_int % 100 == 0:
                   price_int += ROUNDING_MULTIPLE
               return Decimal(price_int)
-
           def detect_delimiter(sample):
               first_line = sample.splitlines()[0] if sample else ""
               sc = first_line.count(";")
@@ -92,7 +84,6 @@ jobs:
               if sc > cc:
                   return ";"
               return ","
-
           def load_provider_map(url, ref_col, dist_col):
               r = requests.get(url, timeout=120)
               r.raise_for_status()
@@ -107,7 +98,6 @@ jobs:
                       continue
                   m[str(ref).strip().lower()] = dist
               return m
-
           def open_worksheet(creds_json, sheet_id, sheet_name):
               import json
               data = json.loads(creds_json)
@@ -116,14 +106,12 @@ jobs:
               if sheet_name:
                   return sh.worksheet(sheet_name)
               return sh.get_worksheet(0)
-
           def find_column_index(header, name):
               name_l = name.strip().lower()
               for i, h in enumerate(header, start=1):
                   if str(h).strip().lower() == name_l:
                       return i
               return None
-
           def money_amount(m):
               if m is None:
                   return None
@@ -133,13 +121,11 @@ jobs:
                       return None
                   return str(a)
               return str(m)
-
           def to_decimal_safe(v):
               try:
                   return Decimal(str(v))
               except (InvalidOperation, TypeError):
                   return None
-
           def shopify_graphql(store, token, version, query, variables):
               url = f"https://{store}/admin/api/{version}/graphql.json"
               headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
@@ -150,7 +136,6 @@ jobs:
               if resp.get("errors"):
                   raise RuntimeError("GraphQL errors: " + "; ".join([e.get("message", "error") for e in resp.get("errors", [])]))
               return resp
-
           def shopify_find_variant_by_candidates(store, token, version, candidates):
               q = """
               query($q: String!) {
@@ -185,7 +170,6 @@ jobs:
                           "compare_at_price": money_amount(node.get("compareAtPrice")),
                       }
               return None
-
           def extract_variant_numeric_id(variant_gid):
               if not variant_gid:
                   return None
@@ -200,7 +184,6 @@ jobs:
                   return int(s)
               except Exception:
                   return None
-
           def shopify_update_variant_price_rest(store, token, version, variant_gid, price):
               vid = extract_variant_numeric_id(variant_gid)
               if vid is None:
@@ -212,7 +195,6 @@ jobs:
               r = requests.put(url, json=payload, headers=headers, timeout=60)
               r.raise_for_status()
               return True
-
           def shopify_update_variant_price(store, token, version, variant_gid, price):
               m = """
               mutation productVariantUpdate($input: ProductVariantInput!) {
@@ -231,7 +213,6 @@ jobs:
                   return True
               except Exception:
                   return shopify_update_variant_price_rest(store, token, version, variant_gid, price)
-
           def update_prices_in_shopify(ws, provider_map, sku_col_name, store, token, version):
               rows = ws.get_all_values()
               if not rows:
@@ -323,7 +304,6 @@ jobs:
               except Exception:
                   pass
               return {"updated": updated, "skipped_compare": skipped_compare, "missing_dist": missing_dist, "not_found": not_found, "unchanged": unchanged}
-
           def main():
               ref_col = os.getenv("PROVIDER_REFERENCE_COLUMN", "referencia")
               dist_col = os.getenv("PROVIDER_DISTRIBUTOR_PRICE_COLUMN", "precio_distribuidores")
@@ -345,11 +325,9 @@ jobs:
                   print(f"shopify_updated={sres['updated']} shopify_skipped_compare={sres['skipped_compare']} shopify_missing_dist={sres['missing_dist']} shopify_not_found={sres['not_found']} shopify_unchanged={sres['unchanged']}")
               else:
                   print("Missing SHOPIFY_STORE or SHOPIFY_ACCESS_TOKEN")
-
           if __name__ == "__main__":
               main()
           PY
-      
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
