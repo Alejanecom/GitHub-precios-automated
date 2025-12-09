@@ -66,22 +66,29 @@ jobs:
           def compute_price_from_distributor(dist):
               mp_raw = os.getenv("MARKUP_PERCENT", "").strip()
               pm_raw = os.getenv("PRICE_MULTIPLIER", "").strip()
+              eq_raw = os.getenv("EQUIVALENCE_PERCENT", "26.2").strip()
               mp = parse_decimal(mp_raw) if mp_raw else None
               pm = parse_decimal(pm_raw) if pm_raw else None
+              eq = parse_decimal(eq_raw) if eq_raw else Decimal("26.2")
+              if eq is None:
+                  eq = Decimal("26.2")
+              eq_mult = Decimal("1") + (eq / Decimal("100"))
+              base = Decimal(dist) * eq_mult
               if mp is not None:
                   mult = Decimal("1") + (mp / Decimal("100"))
+                  raw = base * mult
               elif pm is not None:
-                  mult = pm
+                  raw = Decimal(dist) * pm
               else:
-                  mult = Decimal("1.7037")
-              raw = Decimal(dist) * mult
+                  raw = Decimal(dist) * Decimal("1.7037")
               m = Decimal(ROUNDING_MULTIPLE)
               if raw % m == 0:
                   price_int = int(raw)
               else:
                   price_int = int(((raw // m) + 1) * m)
               if ROUNDING_AVOID_HUNDREDS and price_int % 100 == 0:
-                  price_int += ROUNDING_MULTIPLE
+                  if price_int != 100:
+                      price_int -= ROUNDING_MULTIPLE
               return Decimal(price_int)
 
           def detect_delimiter(sample):
@@ -155,7 +162,7 @@ jobs:
               query($q: String!) {
                 productVariants(first: 5, query: $q) {
                   edges {
-                    node { id sku price compareAtPrice }
+                    node { id sku price compareAtPrice product { handle } }
                   }
                 }
               }
@@ -173,6 +180,7 @@ jobs:
                           "id": node.get("id"),
                           "price": money_amount(node.get("price")),
                           "compare_at_price": money_amount(node.get("compareAtPrice")),
+                          "handle": (node.get("product", {}) or {}).get("handle"),
                       }
                   data = shopify_graphql(store, token, version, q, {"q": c})
                   edges = data.get("data", {}).get("productVariants", {}).get("edges", [])
@@ -182,6 +190,7 @@ jobs:
                           "id": node.get("id"),
                           "price": money_amount(node.get("price")),
                           "compare_at_price": money_amount(node.get("compareAtPrice")),
+                          "handle": (node.get("product", {}) or {}).get("handle"),
                       }
               return None
 
@@ -307,7 +316,11 @@ jobs:
                       shopify_update_variant_price(store, token, version, var["id"], new_price)
                       updated += 1
                       if len(attempts) < 10:
-                          attempts.append({"sku": sku, "current": str(current_dec) if current_dec is not None else None, "new": str(new_price)})
+                          vid = extract_variant_numeric_id(var.get("id"))
+                          url = None
+                          if var.get("handle") and vid is not None:
+                              url = f"https://{store}/products/{var.get('handle')}?variant={vid}"
+                          attempts.append({"sku": sku, "current": str(current_dec) if current_dec is not None else None, "new": str(new_price), "url": url})
                   except Exception as e:
                       if len(errors) < 10:
                           errors.append({"sku": sku, "error": str(e)})
@@ -374,5 +387,6 @@ jobs:
           FALLBACK_SEARCH_MAX_QUERIES: "2"
           MAX_SKUS_PER_RUN: "80"
           MAX_RUNTIME_SECONDS: "600"
-          PRICE_MULTIPLIER: "1.7037"
+          MARKUP_PERCENT: "45"
+          EQUIVALENCE_PERCENT: "26.2"
         run: python app.py
